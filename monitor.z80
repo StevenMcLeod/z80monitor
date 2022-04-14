@@ -1,0 +1,1015 @@
+; Command Bytes are sent as hex character pairs, uppercase.
+; No spaces between bytes.
+; E.g. R10000100<NL>
+; Read/Write Data bytes sent as binary 8-bit.
+; Commands return 1-digit code + description string. 0 = OK
+
+; To use library, define DEBUG_BASE address. Will use 32 bytes of data + 32 byte stack (64).
+; First 32 bytes should not cross a 256B boundary
+; TODO calculate max stack size
+; As well, provide a serial buffer INBUF with size INBUF_SZ.
+; If post debugger calls are needed, define DEBUG_POST label.
+
+; Commands:
+;   R <addr> <len>: Read len bytes starting at addr.
+;   W <addr> <len>: Write len bytes starting at addr in ASCII, following NL.
+;   B <addr> <len>: Write len bytes starting at addr in binary, following NL.
+;   L             : Load all registers.
+;   S <reg> <val> : Store a value in a register.
+;       - 8-bit: A, F, B, C, D, E, H, L, W (IXH), X (IXL), Y (IYH), Z (IYL)
+;       - 16-bit: AF, BC, DE, HL, IX, IY, SP, PC
+;
+;   I <port>      : Read from IO port.
+;   O <port> <val>: Write to IO port.
+;   G [addr]      : Run, optionally at addr.
+;   U <addr>      : Run until addr is encountered.
+;   T [qty]       : Run the next qty instructions (default 1).
+;   P [qty]       : Run the next qty instructions stepping over CALL/RSTs (default 1). TODO
+;   C <addr>      : Call the subroutine at addr.
+;   N             : Print out next instruction bytes.
+
+; Variable locations:
+; Stored Little Endian !
+DEBUG_PC:   EQU DEBUG_BASE+00h  
+DEBUG_SP:   EQU DEBUG_BASE+02h
+DEBUG_IY:   EQU DEBUG_BASE+04h
+DEBUG_IX:   EQU DEBUG_BASE+06h
+DEBUG_HL:   EQU DEBUG_BASE+08h
+DEBUG_DE:   EQU DEBUG_BASE+0Ah
+DEBUG_BC:   EQU DEBUG_BASE+0Ch
+DEBUG_AF:   EQU DEBUG_BASE+0Eh
+
+DEBUG_NXTPC:EQU DEBUG_BASE+10h
+DEBUG_TVAL: EQU DEBUG_BASE+12h
+DEBUG_TMODE:EQU DEBUG_BASE+14h  ; Z = TVAL count, NZ = TVAL addr
+DEBUG_DBUF: EQU DEBUG_BASE+15h  ; 4 byte general purpose buffer
+DEBUG_IBUF: EQU DEBUG_BASE+19h  ; 4 byte longest opcode + JP mon_trace_ret
+DEBUG_STK:  EQU DEBUG_BASE+40h
+
+monitor:
+    ; Store registers
+    LD      (DEBUG_HL), HL
+    POP     HL              ; Main code return address
+    LD      (DEBUG_PC), HL
+    
+    PUSH    AF
+    POP     HL
+    LD      (DEBUG_AF), HL
+
+    LD      HL, 0
+    ADD     HL, SP
+    LD      (DEBUG_SP), HL
+    LD      SP, DEBUG_STK
+    CALL    mon_store_regs
+
+    ; Load next opcode into buf
+    CALL    mon_opc_next
+
+monitor_loop:
+    ; Print prompt
+    LD      L, '>'
+    CALL    ser_write
+
+    ; Read command string
+    LD      HL, INBUF
+    LD      C, INBUF_SZ-1
+    CALL    read_str        ; HL = Stringptr, B = Len
+
+    INC     HL
+    LD      A, (HL)     ; Get CMD Byte
+    INC     HL
+
+    ; Test for command
+    CP      'R'
+    JP      Z, mon_read
+
+    CP      'W'
+mon_write_jp:
+    JP      Z, mon_write
+
+    CP      'B'
+    JR      Z, mon_write_jp
+
+    CP      'L'
+    JP      Z, mon_load
+
+    CP      'S'
+    JP      Z, mon_store
+
+    CP      'I'
+    JP      Z, mon_input
+
+    CP      'O'
+    JP      Z, mon_output
+
+    CP      'G'
+    JP      Z, mon_go
+
+    CP      'U'
+    JP      Z, mon_until
+
+    CP      'T'
+    JP      Z, mon_trace
+
+    CP      'C'
+    JP      Z, mon_call
+
+    CP      'N'
+    JP      Z, mon_next
+    
+    LD      HL, s_mon_badcmd
+    JR      mon_printstat 
+
+mon_bad_inp:
+    LD      HL, s_mon_badinp
+    JR      mon_printstat
+
+mon_good:
+    LD      HL, s_mon_ok
+mon_printstat:
+    CALL    print_str
+    JR      monitor_loop
+
+mon_read:
+    ; Raaaallll : Read llll bytes at aaaa
+    LD      A, B
+    CP      9
+    JP      NZ, mon_bad_inp
+
+    CALL    pchar2word
+    PUSH    DE
+    CALL    pchar2word
+    LD      B, D
+    LD      C, E            ; BC = len
+    POP     DE              ; DE = addr
+
+mon_read_l:
+    PUSH    BC
+    LD      A, (DE)
+    INC     DE
+    LD      (DEBUG_DBUF), DE
+
+    ; Print byte
+    CALL    byte2char
+    LD      H, E
+    LD      L, D
+    CALL    ser_write
+    LD      L, H
+    CALL    ser_write
+    LD      L, ' '
+    CALL    ser_write
+    POP     BC
+
+    LD      DE, (DEBUG_DBUF)
+    DEC     BC
+    LD      A, C
+    OR      B
+    JR      NZ, mon_read_l
+    JP      mon_good
+
+mon_write:
+    ; Waaaallll : Write llll bytes at aaaa in ascii (no separator)
+    ; Baaaallll : Write llll bytes at aaaa in binary
+    
+    ; Z if ascii, NZ if binary
+    SUB     'W'
+    LD      (DEBUG_DBUF+2), A
+
+    LD      A, B
+    CP      9
+    JP      NZ, mon_bad_inp
+
+    CALL    pchar2word
+    LD      (DEBUG_DBUF), DE; DEBUG_DBUF = addr
+    CALL    pchar2word
+    LD      B, D
+    LD      C, E            ; BC = len
+
+mon_write_l:
+    PUSH    BC
+    CALL    ser_read
+
+    ; Z if ascii, NZ if binary
+    LD      A, (DEBUG_DBUF+2)
+    OR      A
+    LD      A, L                ; Put into A incase binary
+    JR      NZ, mon_write_binary
+
+    ; Ascii mode
+    LD      H, A
+    CALL    ser_read
+
+    EX      DE, HL
+    CALL    char2byte
+
+mon_write_binary:
+    ; Byte in A
+    LD      HL, (DEBUG_DBUF)
+    LD      (HL), A
+    
+
+    INC     HL
+    LD      (DEBUG_DBUF), HL
+    
+    POP     BC
+    DEC     BC
+    LD      A, C
+    OR      B
+    JR      NZ, mon_write_l
+    JP      mon_good
+
+mon_load:
+    ; L         : Display All
+    LD      A, B
+    CP      1
+    JP      NZ, mon_bad_inp
+
+    LD      IX, DEBUG_AF+1
+    LD      B, t_reg16_sz
+mon_load_l:
+    PUSH    BC
+
+    ; Get table addr
+    LD      H, t_reg16/256
+    LD      A, B
+    ADD     A, A
+    ADD     A, t_reg16%256 - 2 ; B is one ahead
+    LD      L, A
+
+    ; Print register name
+    LD      A, (HL)
+    INC     HL
+    LD      H, (HL)
+    LD      L, A
+    CALL    ser_write
+    LD      L, H
+    CALL    ser_write
+
+    LD      L, '='
+    CALL    ser_write
+
+    ; String ptr
+    LD      HL, DEBUG_DBUF
+
+    ; Lower Byte
+    LD      A, (IX+0)
+    DEC     IX
+    CALL    byte2char
+    LD      (HL), D
+    INC     HL
+    LD      (HL), E
+    INC     HL
+
+    LD      A, (IX+0)
+    DEC     IX
+    CALL    byte2char
+    LD      (HL), D
+    INC     HL
+    LD      (HL), E
+
+    ; Print register word + NL
+    LD      B, 4
+    LD      L, DEBUG_DBUF%256
+    CALL    print_str_sepr
+
+    POP     BC
+    DJNZ    mon_load_l
+    JP      mon_good
+
+mon_store:
+    ; Srvv      : Set Reg8
+    ; Srrvvvv   : Set Reg16
+    LD      A, B
+    CP      4
+    JR      Z, mon_store8
+
+    CP      7
+    JP      NZ, mon_bad_inp
+
+    ; Do 16-bit store
+    LD      D, (HL)
+    INC     HL
+    LD      E, (HL)
+
+    LD      B, t_reg16_sz
+    LD      HL, t_reg16+(2*t_reg16_sz)-1
+mon_store16_l:
+    LD      A, (HL)
+    DEC     HL
+    CP      E
+    LD      A, (HL)
+    DEC     HL                      ; Early DEC for next iter
+    JR      NZ, mon_store16_miss    ; From CP E
+    
+    CP      D
+    JR      Z, mon_store16_found    ; From CP D
+
+mon_store16_miss:
+    DJNZ    mon_store16_l
+    JR      mon_store_badreg
+
+mon_store16_found:
+    ; B contains index of reg/2
+    ; HL can be recalled at INBUF+4
+    LD      HL, INBUF+4
+    CALL    pchar2word
+
+    LD      H, DEBUG_PC/256
+IF (DEBUG_PC%256)!=0
+    LD      A, B
+    ADD     A, A
+    ADD     A, -2+(DEBUG_PC%256)
+ELSE
+    LD      A, B
+    DEC     A
+    ADD     A, A
+ENDIF
+    LD      L, A
+
+    LD      (HL), E
+    INC     HL
+    LD      (HL), D
+    
+    ; If setting PC then reload IBUF
+    LD      A, L
+    CP      0+(DEBUG_PC+1)%256  ; Last byte of DEBUG_PC
+    CALL    Z, mon_opc_next
+    JP      mon_good
+
+    ; Do 8-bit store
+mon_store8:
+    LD      C, (HL)
+    INC     HL
+    CALL    pchar2byte
+    LD      D, A        ; Value to store
+
+    LD      B, t_reg8_sz
+    LD      HL, t_reg8+t_reg8_sz-1
+mon_store8_l:
+    LD      A, (HL)
+    CP      C
+    JR      Z, mon_store8_found
+    DEC     HL
+    DJNZ    mon_store8_l
+
+mon_store_badreg:
+    ; Register not found
+    LD      HL, s_mon_badreg
+    JP      mon_printstat
+
+mon_store8_found:
+    ; B contains index of reg
+    LD      H, DEBUG_IY/256
+IF -1+(DEBUG_IY%256)!=0
+    LD      A, B
+    ADD     A, -1+(DEBUG_IY%256)
+    LD      L, A
+ELSE
+    LD      L, B
+    DEC     L
+ENDIF
+
+    LD      (HL), D
+    JP      mon_good
+
+; * TESTED *
+mon_input:
+    ; Ipp       : Input at port
+    LD      A, B
+    CP      3
+    JP      NZ, mon_bad_inp
+
+    CALL    pchar2byte
+    LD      C, A
+    IN      A, (C)
+
+    CALL    byte2char
+    LD      H, E
+    LD      L, D
+    CALL    ser_write
+    LD      L, H
+    CALL    ser_write
+    LD      L, '\n'
+    CALL    ser_write
+    JP      mon_good
+
+; * TESTED *
+mon_output:
+    ; Oppvv     : Output at port
+    LD      A, B
+    CP      5
+    JP      NZ, mon_bad_inp
+
+    CALL    pchar2byte
+    LD      C, A
+    CALL    pchar2byte
+    OUT     (C), A
+    JP      mon_good
+
+mon_go:
+    ; G         : Go
+    ; Gxxxx     : Set PC, Go
+    LD      A, B
+    CP      1
+    JR      Z, mon_go_go
+
+    CP      5
+    JP      NZ, mon_bad_inp
+
+    CALL    pchar2word
+    LD      (DEBUG_PC), DE
+
+mon_go_go:
+    ; TODO: Comment if not needed
+    CALL    DEBUG_POST
+
+    CALL    mon_reload_regs
+
+    LD      HL, (DEBUG_PC)
+    PUSH    HL
+    LD      HL, (DEBUG_HL)
+    RET
+
+mon_until:
+    ; Uaaaa     ; Do until addr
+    LD      A, B
+    SUB     5
+    JP      NZ, mon_bad_inp
+
+    ; A == 0
+    DEC     A
+    LD      (DEBUG_TMODE), A    ; Addr mode
+
+    CALL    pchar2word
+    LD      (DEBUG_TVAL), DE
+    JP      mon_trace_l
+
+mon_trace:
+    ; T         : Do next instr
+    ; Tnnnn     ; Do nnnn instr
+    LD      A, B
+    CP      1
+    LD      DE, 1
+    JP      Z, mon_trace_savecount
+
+    CP      5
+    JP      NZ, mon_bad_inp
+    CALL    pchar2word
+
+mon_trace_savecount:
+    LD      (DEBUG_TVAL), DE
+    XOR     A
+    LD      (DEBUG_TMODE), A    ; Count mode
+
+mon_trace_l:
+    LD      A, (DEBUG_IBUF)
+    CALL    mon_do_if_jmp
+    JP      C, mon_trace_update
+
+    ; Reload registers
+    CALL    mon_reload_regs
+    LD      HL, (DEBUG_NXTPC)
+    LD      (DEBUG_PC), HL
+    LD      HL, (DEBUG_HL)
+    JP      DEBUG_IBUF
+
+mon_trace_ret:
+    ; Store registers
+    LD      (DEBUG_HL), HL
+    PUSH    AF
+    POP     HL
+    LD      (DEBUG_AF), HL
+
+    LD      HL, 0
+    ADD     HL, SP
+    LD      (DEBUG_SP), HL
+    LD      SP, DEBUG_STK
+    CALL    mon_store_regs
+
+mon_trace_update:
+    CALL    mon_opc_next
+
+    LD      A, (DEBUG_TMODE)
+    OR      A
+    JR      Z, mon_trace_dec
+    
+    ; Check for addr
+    LD      HL, (DEBUG_PC)
+    LD      DE, (DEBUG_TVAL)
+    SBC     HL, DE
+    LD      A, L
+    OR      H
+    JR      NZ, mon_trace_l
+    JP      mon_good
+
+mon_trace_dec:
+    ; Dec counter
+    LD      HL, (DEBUG_TVAL)
+    DEC     HL
+    LD      (DEBUG_TVAL), HL
+    JR      NZ, mon_trace_l
+    JP      mon_good
+
+mon_call:
+    ; Caaaa     ; Call subroutine at aaaa.
+    LD      A, B
+    CP      5
+    JP      NZ, mon_bad_inp
+
+    CALL    pchar2word
+    LD      (DEBUG_DBUF), DE
+
+    ; Push return addr
+    LD      DE, mon_call_ret
+    LD      HL, (DEBUG_SP)
+    DEC     HL
+    LD      (HL), D                 ; D first since little endian
+    DEC     HL
+    LD      (HL), E
+    LD      (DEBUG_SP), HL
+
+    CALL    mon_reload_regs
+
+    LD      HL, (DEBUG_DBUF)
+    PUSH    HL
+    LD      HL, (DEBUG_HL)
+    RET
+
+mon_call_ret:
+    ; Store registers
+    LD      (DEBUG_HL), HL
+    PUSH    AF
+    POP     HL
+    LD      (DEBUG_AF), HL
+
+    LD      HL, 0
+    ADD     HL, SP
+    LD      (DEBUG_SP), HL
+    LD      SP, DEBUG_STK
+    CALL    mon_store_regs
+
+    JP      mon_good
+
+mon_next:
+    ; I         ; Print instruction buffer
+    LD      A, B
+    CP      1
+    JP      NZ, mon_bad_inp
+
+    ; Carry cleared by CP 1
+    LD      HL, (DEBUG_NXTPC)
+    LD      DE, (DEBUG_PC)
+    SBC     HL, DE
+    LD      B, L
+
+    LD      HL, DEBUG_IBUF
+mon_next_l:
+    LD      A, (HL)
+    INC     HL
+    PUSH    BC
+    PUSH    HL
+
+    CALL    byte2char
+    LD      L, D
+    LD      H, E
+    CALL    ser_write
+    LD      L, H
+    CALL    ser_write
+    LD      L, ' '
+    CALL    ser_write
+
+    POP     HL
+    POP     BC
+    DJNZ    mon_next_l
+
+    LD      L, '\n'
+    CALL    ser_write
+    JP      mon_good
+
+; * Common Functions *
+; Reloads all regs (including SP) except HL, PC.
+mon_reload_regs:
+    POP     DE              ; Return address
+
+    LD      HL, (DEBUG_AF)
+    PUSH    HL
+    POP     AF
+    
+    LD      BC, (DEBUG_BC)
+    LD      IX, (DEBUG_IX)
+    LD      IY, (DEBUG_IY)
+    
+    LD      HL, (DEBUG_SP)
+    LD      SP, HL
+
+    LD      HL, (DEBUG_DE)
+    EX      DE, HL
+    JP      (HL)            ; Pseudo "RET"
+
+; Stores all regs except HL, AF, SP, PC.
+; HL should already be stored
+; SP set to debug stack
+mon_store_regs:
+    LD      (DEBUG_BC), BC
+    LD      (DEBUG_DE), DE
+    LD      (DEBUG_IX), IX
+    LD      (DEBUG_IY), IY
+    RET
+
+; Calculate size of next opcode
+; Size in B
+mon_size_opc:
+    ; Current PC in DEBUG_PC
+    LD      HL, (DEBUG_PC)
+
+    ; Check which quarter of the table its in
+    LD      A, (HL)
+    CP      40h
+    JR      C, mon_size_03
+
+    CP      0C0h
+    JR      NC, mon_size_CF
+
+    LD      B, 1
+    RET
+
+mon_size_03:
+    LD      DE, t_opc03
+    JR      mon_size_tbl
+
+mon_size_CF:
+    LD      DE, t_opcCF
+mon_size_tbl:
+    AND     3Fh         ; Get relevant part of opc
+    ADD     A, E        ; Does not cross 256B boundary
+    LD      E, A
+    LD      A, (DE)
+
+    ; Check if first two bits set for special instruction 
+    LD      B, A
+    RLCA
+    JR      C, mon_size_ixiy     ; 80h == IXIY instruction
+    RLCA
+    RET     NC                  ; 40h == EX instruction
+
+    ; EX Instruction
+    ; To calculate size, if opc & 0Fh is 4 or B, then size == 4. Else, 2.
+    INC     HL
+    LD      A, (HL)
+    DEC     HL
+
+    LD      B, 4
+    AND     0Fh
+
+    CP      04h
+    RET     Z
+    CP      0Bh
+    RET     Z
+    LD      B, 2
+    RET
+
+mon_size_ixiy:
+    ; IXIY Instruction
+    ; TODO, fail for now.
+    LD      HL, s_mon_badopc
+    CALL    print_str
+mon_size_fail:
+    HALT
+    JR      mon_size_fail
+
+; Load IBUF with next opcode
+mon_opc_next:
+    CALL    mon_size_opc
+    LD      HL, (DEBUG_PC)
+    LD      DE, DEBUG_IBUF
+mon_opc_move:
+    LD      A, (HL)
+    LD      (DE), A
+    INC     HL
+    INC     DE
+    DJNZ    mon_opc_move
+    
+    ; Update NXTPC
+    LD      (DEBUG_NXTPC), HL
+
+    ; Trace return opcode
+    LD      A, 0C3h         ; JP mon_trace_ret
+    LD      (DE), A
+    INC     DE
+    LD      A, mon_trace_ret%256
+    LD      (DE), A
+    INC     DE
+    LD      A, mon_trace_ret/256
+    LD      (DE), A
+    RET
+
+; CF set if jump done
+mon_do_if_jmp:
+    LD      C, A
+
+    ; Check if 10, 20, 30, 18, 28, 38
+
+    ; if(A == 0x10)
+    CP      10h
+    JR      Z, mon_is_jmp_djnz
+    
+    ; if(A == 0x18)
+    CP      18h
+    JR      Z, mon_is_jmp_rel
+
+    ; if((A & 0b11010111) == 0b00000000)        // 20, 28, 30, 38
+    AND     11000111b
+    JR      Z, mon_is_jmp_relc
+
+    ; Check if Cx
+    LD      A, C
+    AND     11000000b
+    CP      11000000b
+    JR      NZ, mon_is_jmp_f
+
+    ; Check opcode groups
+    LD      A, C
+    AND     00000111b
+    JR      Z, mon_is_jmp_retc
+
+    CP      02h
+    JR      Z, mon_is_jmp_jpc
+
+    CP      04h
+    JR      Z, mon_is_jmp_callc
+
+    CP      07h
+    JR      Z, mon_is_jmp_rst
+
+    ; Check specific opcodes
+    LD      A, C
+    CP      0C3h
+    JR      Z, mon_is_jmp_jp
+
+    CP      0C9h
+    JR      Z, mon_is_jmp_ret
+
+    CP      0E9h
+    JR      Z, mon_is_jmp_indir
+
+    CP      0CDh
+    JR      Z, mon_is_jmp_call
+
+mon_is_jmp_f:
+    ; Not jump
+    XOR     A       ; Clear Carry
+    RET
+
+mon_is_jmp_indir:
+    LD      HL, (DEBUG_HL)  ; TODO If IX/IY command, pull those
+    LD      (DEBUG_PC), HL
+    SCF
+    RET
+
+mon_is_jmp_djnz:
+    LD      A, (DEBUG_BC+1)
+    DEC     A
+    LD      (DEBUG_BC+1), A
+    JR      Z, mon_is_jmp_advpc     ; DJNZ done
+    JR      mon_is_jmp_rel
+
+mon_is_jmp_relc:
+    LD      A, C
+    SUB     20h     ; Correct for cond calculation
+    CALL    mon_calculate_cond
+    JR      NZ, mon_is_jmp_advpc 
+    
+mon_is_jmp_rel:
+    LD      A, (DEBUG_IBUF+1)
+    LD      E, A
+    ADD     A, A    ; Sign bit to carry
+    SBC     A, A    ; Sign extension
+    LD      D, A
+
+    LD      HL, (DEBUG_NXTPC)
+    ADD     HL, DE
+    LD      (DEBUG_PC), HL
+    SCF
+    RET
+
+mon_is_jmp_retc:
+    LD      A, C
+    CALL    mon_calculate_cond
+    JR      NZ, mon_is_jmp_advpc 
+    
+mon_is_jmp_ret:
+    LD      HL, (DEBUG_SP)
+    LD      E, (HL)
+    INC     HL
+    LD      D, (HL)         ; D last since little endian
+    INC     HL
+    LD      (DEBUG_SP), HL
+    LD      (DEBUG_PC), DE
+    SCF
+    RET
+
+mon_is_jmp_jpc:
+    LD      A, C
+    CALL    mon_calculate_cond
+    JR      NZ, mon_is_jmp_advpc
+
+mon_is_jmp_jp:
+    ; PC replaced with word
+    LD      HL, (DEBUG_IBUF+1)
+    LD      (DEBUG_PC), HL
+    SCF
+    RET
+
+mon_is_jmp_advpc:
+    LD      HL, (DEBUG_NXTPC)
+    LD      (DEBUG_PC), HL
+    SCF
+    RET
+
+mon_is_jmp_callc:
+    LD      A, C
+    CALL    mon_calculate_cond
+    JR      NZ, mon_is_jmp_advpc
+    
+mon_is_jmp_call:
+    ; Load new PC
+    LD      HL, (DEBUG_IBUF+1)
+    JR      mon_is_jmp_dostk    
+
+mon_is_jmp_rst:
+    LD      A, C
+    AND     ~0C7h
+
+    ; Load new PC
+    LD      H, 0
+    LD      L, A
+
+mon_is_jmp_dostk:
+    LD      (DEBUG_PC), HL
+
+    ; Put return address on stack
+    LD      DE, (DEBUG_NXTPC)       ; return addr
+    LD      HL, (DEBUG_SP)
+    DEC     HL
+    LD      (HL), D                 ; D first since little endian
+    DEC     HL
+    LD      (HL), E
+    LD      (DEBUG_SP), HL
+    SCF
+    RET
+
+; Z - Cond true
+; NZ- Cond false
+mon_calculate_cond:
+    ; A contains opcode
+    LD      E, 0
+    RRCA                ; Bit3 = 1 means cond is positive
+    RRCA
+    RRCA
+    RRCA                ; Bits 5, 4 in A
+    JR      C, mon_calculate_cond_positive
+    INC     E           ; Will be dec'd later to 0 for null mask
+    
+mon_calculate_cond_positive:
+    ; Decode Condition
+    AND     03h
+    LD      H, t_cond/256
+    ADD     A, t_cond%256
+    LD      L, A
+    LD      D, (HL)
+    
+    ; Fix E
+    DEC     E
+    JR      Z, mon_calculate_cond_comp
+    LD      E, D
+
+mon_calculate_cond_comp:
+    LD      A, (DEBUG_AF)   ; Flag reg
+    AND     D
+    CP      E               ; Result in Z flag
+    RET
+
+; Input:
+;   HL - Char ptr
+; Output:
+;   DE - Word
+;   HL - Ptr + 4
+pchar2word:
+    CALL    pchar2byte
+    
+    PUSH    AF
+    CALL    pchar2byte
+
+    LD      E, A
+    POP     AF
+    LD      D, A
+    RET
+
+; Input:
+;   HL - Char ptr
+; Output:
+;   A - Byte
+;   HL - Ptr + 2
+pchar2byte:
+    LD      D, (HL)
+    INC     HL
+    LD      E, (HL)
+    INC     HL
+
+; Input:
+;   DE - Bytes
+; Output:
+;   A - Byte
+char2byte:
+    LD      A, D
+    CALL    ctox
+
+    ADD     A, A
+    ADD     A, A
+    ADD     A, A
+    ADD     A, A
+    LD      D, A
+
+    LD      A, E
+    CALL    ctox
+
+    OR      D
+    RET
+
+ctox:
+    SUB     A, '0'
+    CP      0Ah
+    RET     C
+    SUB     A, 'A'-'0'-0Ah
+    RET
+
+; A - byte
+; DE - Uppercase ASCII
+byte2char:
+    LD      D, A
+    RRA
+    RRA
+    RRA
+    RRA
+    CALL    xtoc
+    LD      A, D
+    LD      D, E
+    
+xtoc:
+    AND     0Fh
+    ADD     A, 90h
+    DAA
+    ADC     A, 40h
+    DAA
+    LD      E, A
+    RET
+
+; Tables
+t_reg8_sz: EQU 12
+t_reg8:
+    ;DB "YZWXHLDEBCAF"
+    DB "ZYXWLHEDCBFA"
+
+t_reg16_sz: EQU 8
+t_reg16:
+    DB "PCSPIYIXHLDEBCAF"
+
+t_cond_sz: EQU 8
+t_cond:
+    DB 40h, 01h, 04h, 80h
+
+t_opc03_sz: EQU 40h
+t_opc03:
+    DB 1, 3, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 2, 1
+    DB 2, 3, 1, 1, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 2, 1
+    DB 2, 3, 3, 1, 1, 1, 2, 1, 2, 1, 3, 1, 1, 1, 2, 1
+    DB 2, 3, 3, 1, 1, 1, 2, 1, 2, 1, 3, 1, 1, 1, 2, 1
+
+t_opcCF_sz: EQU 40h
+t_opcCF:
+    DB 1, 1, 3, 3, 3, 1, 2, 1, 1, 1, 3, 2, 3,   3, 2, 1
+    DB 1, 1, 3, 2, 3, 1, 2, 1, 1, 1, 3, 2, 3, 80h, 2, 1
+    DB 1, 1, 3, 1, 3, 1, 2, 1, 1, 1, 3, 1, 3, 40h, 2, 1
+    DB 1, 1, 3, 1, 3, 1, 2, 1, 1, 1, 3, 1, 3, 80h, 2, 1
+
+
+; Return strings
+s_mon_ok:
+    DB 3
+    DB "0OK"
+
+s_mon_badcmd:
+    DB 7
+    DB "1BadCmd"
+
+s_mon_badinp:
+    DB 9
+    DB "1BadInput"
+
+s_mon_badreg:
+    DB 7
+    DB "1BadReg"
+
+s_mon_badopc:
+    DB 7
+    DB "2BadOpc"
