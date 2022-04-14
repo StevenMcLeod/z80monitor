@@ -622,6 +622,7 @@ mon_size_opc:
     ; Current PC in DEBUG_PC
     LD      HL, (DEBUG_PC)
 
+mon_size_pre:
     ; Check which quarter of the table its in
     LD      A, (HL)
     CP      40h
@@ -648,34 +649,74 @@ mon_size_tbl:
     ; Check if first two bits set for special instruction 
     LD      B, A
     RLCA
-    JR      C, mon_size_ixiy     ; 80h == IXIY instruction
+    JR      C, mon_size_ixiy    ; 80h == IXIY instruction
     RLCA
     RET     NC                  ; 40h == EX instruction
 
     ; EX Instruction
-    ; To calculate size, if opc & 0Fh is 4 or B, then size == 4. Else, 2.
+    ; To calculate size, if opc & C7h is 43h, then size == 4. Else, 2.
     INC     HL
     LD      A, (HL)
     DEC     HL
 
     LD      B, 4
-    AND     0Fh
+    AND     0C7h
 
-    CP      04h
-    RET     Z
-    CP      0Bh
+    CP      43h
     RET     Z
     LD      B, 2
     RET
 
 mon_size_ixiy:
     ; IXIY Instruction
-    ; TODO, fail for now.
-    LD      HL, s_mon_badopc
-    CALL    print_str
-mon_size_fail:
-    HALT
-    JR      mon_size_fail
+    ; Skip over all next 0xDD, 0xFD
+    ; (DEBUG_PC) still in HL
+    INC     HL
+    LD      A, (HL)
+    CP      0DDh
+    JR      Z, mon_size_ixiy
+    CP      0FDh
+    JR      Z, mon_size_ixiy
+    CALL    mon_size_pre
+
+    ; Test if this refers to (IX), adds 1 byte
+    LD      A, (HL)
+    LD      E, A
+    CP      76h                 ; IX HALT
+    JR      Z, mon_size_ixiy_done
+
+    ; Test for misc opcodes
+    CP      0CBh                ; IX Bits
+    JR      Z, mon_size_ixiy_inc
+    CP      36h                 ; LD (IX+r), imm
+    JR      Z, mon_size_ixiy_inc
+    AND     0FEh
+    CP      34h                 ; INC (IX+r); DEC (IX+r)
+    JR      Z, mon_size_ixiy_inc
+
+    ; Test for alu A, (IX+r)
+    LD      A, E
+    AND     0C7h
+    CP      86h                 ; 86, 8E, 96, 9E, A6, AE, B6, BE
+    JR      Z, mon_size_ixiy_inc
+    ; Test for LD r, (IX+r)
+    CP      46h                 ; 46, 4E, 56, 5E, 66, 6E, 7E
+    JR      Z, mon_size_ixiy_inc
+
+    ; Test for LD (IX+r), r
+    LD      A, E
+    AND     0F8h
+    CP      70h                 ; 70 - 77 excl. 76
+    JR      NZ, mon_size_ixiy_done
+
+mon_size_ixiy_inc:
+    INC     B
+
+mon_size_ixiy_done:
+    INC     B
+    DEC     HL
+    LD      (DEBUG_PC), HL
+    RET
 
 ; Load IBUF with next opcode
 mon_opc_next:
@@ -1009,7 +1050,3 @@ s_mon_badinp:
 s_mon_badreg:
     DB 7
     DB "1BadReg"
-
-s_mon_badopc:
-    DB 7
-    DB "2BadOpc"
