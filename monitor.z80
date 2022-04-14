@@ -802,7 +802,22 @@ mon_is_jmp_f:
     RET
 
 mon_is_jmp_indir:
-    LD      HL, (DEBUG_HL)  ; TODO If IX/IY command, pull those
+    ; Test (DEBUG_IBUF+0) for DDh, FDh
+    LD      A, (DEBUG_IBUF+0)
+    CP      0DDh
+    JR      NZ, mon_is_jmp_indir_iy
+    LD      HL, (DEBUG_IX)              ; JP (IX)
+    JR      mon_is_jmp_indir_join
+
+    CP      0FDh
+    JR      NZ, mon_is_jmp_indir_hl
+    LD      HL, (DEBUG_IY)              ; JP (IY)
+    JR      mon_is_jmp_indir_join
+
+mon_is_jmp_indir_hl:
+    LD      HL, (DEBUG_HL)              ; JP (HL)
+
+mon_is_jmp_indir_join:
     LD      (DEBUG_PC), HL
     SCF
     RET
