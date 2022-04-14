@@ -1,0 +1,242 @@
+; Serial Library
+; By Steven McLeod
+; Jun. 20, 2020
+
+; *** Constants ***
+IF FASTCLOCK==1
+b4800_cnt: EQU 22
+b2400_cnt: EQU 44
+b1200_cnt: EQU 88
+b600_cnt:  EQU 175
+b300_cnt:  EQU 351
+ELSE
+b4800_cnt: EQU 11
+b2400_cnt: EQU 22
+b1200_cnt: EQU 44
+b600_cnt:  EQU 88
+b300_cnt:  EQU 175
+ENDIF
+
+; MUST SET WRITE_EOL, READ_EOL to 0, 1, 2.
+;   0: NL Mode
+;   1: CR Mode
+;   2: CRLF Mode
+
+; Must init portA to input, portB to output, B.7 = 1
+
+; PORTA: In
+;   [4:0]: PPU Tilecounter
+;   [5]:   Ctrl I
+;   [6]:   Ctrl II
+;   [7]:   SerIn
+;
+; PORTB: Out
+;   [3:0]: TriWave Ctrl
+;   [4]:   Expansion
+;   [5]:   Ctrl Clk
+;   [6]:   Ctrl Latch
+;   [7]:   SerOut
+
+; Inputs: HL - Ptr to pstr
+; Modifies: A, BC, DE, HL
+print_str:
+    LD      B, (HL)
+
+print_str_loop:
+    INC     HL
+print_str_sepr:     ; Call if HL has str ptr, B has len
+    PUSH    HL
+    PUSH    BC
+    LD      L, (HL)
+    CALL    ser_write
+
+    POP     BC
+    POP     HL
+    DJNZ    print_str_loop
+
+;IF WRITE_EOL == 0
+    LD      L, '\n'
+    CALL    ser_write
+;ELSE IF WRITE_EOL==1
+;    LD      L, '\r'
+;    CALL    ser_write
+;ELSE IF WRITE_EOL == 2
+;    LD      L, '\r'
+;    CALL    ser_write
+;    LD      L, '\n'
+;    CALL    ser_write
+;ELSE
+;    HALT    INVALID_WRITE_EOL
+;ENDIF
+
+    RET
+
+; Inputs: HL - Ptr to pstr
+;         C - Max Size (no size byte)
+; Output: B - String sz
+;         HL - Ptr to pstr
+; Modifies: A, B, DE
+read_str:
+    PUSH    HL      ; Length byte
+    INC     HL
+    LD      B, 0
+read_str_loop:
+    LD      A, B
+    CP      C
+    JR      NC, read_str_end    ; if(B >= C)
+
+    PUSH    BC
+    PUSH    HL
+    CALL    ser_read
+    
+    LD      A, L
+    POP     HL
+    POP     BC
+
+    ; Check for EOL
+;IF READ_EOL == 0
+    CP      '\n'
+    JR      Z, read_str_end
+;ELSE IF READ_EOL == 1
+;    CP      '\n'
+;    JR      Z, read_str_end
+;ELSE IF READ_EOL == 2
+;    CP      '\r'
+;    JR      Z, read_str_end
+;
+;    ; NL from last string, ignore
+;    CP      '\n'
+;    JR      Z, read_str_loop
+;ELSE
+;    HALT    INVALID_READ_EOL
+;ENDIF
+
+    LD      (HL), A
+    INC     HL
+    INC     B
+    JR      read_str_loop
+
+read_str_end:
+    POP     HL
+    LD      (HL), B
+    RET
+
+; Character Send/Recv
+
+; Inputs:   L - Byte
+; Modifies: A, BC, DE, L
+; Notes:
+;   NMI / INT ** must ** be disabled prior
+;   Outputs to PortB.7
+ser_write:
+    LD      A, 0Fh
+    LD      (SNDREG), A
+
+    ; Store Port B
+    ;LD      A, (SNDREAD)
+    LD      A, 0FFh
+    AND     01111111b       ; Clears carry
+    RLA
+    LD      E, A
+    
+    ; Start Bit
+    RRA
+    LD      (SNDWRITE), A
+    RLA
+    LD      BC, b300_cnt
+    CALL    do_ser_wait
+
+    LD      D, 8
+    ; Data Bits
+ser_write_loop:
+    RRC     L               ; Take bit 0 from L...
+    RRA                     ; Put it into bit 7 of A
+    LD      (SNDWRITE), A
+    LD      BC, b300_cnt
+    CALL    do_ser_wait
+
+    LD      A, E
+    DEC     D
+    JR      NZ, ser_write_loop
+
+    ; Stop Bit
+    SCF
+    RRA
+    LD      (SNDWRITE), A
+    LD      BC, b300_cnt
+    CALL    do_ser_wait
+
+    RET
+
+; Outputs: L - Byte
+; Modifies: A, BC, DE, L
+; Notes:
+;   E: sample_cnt
+;   D: bit_idx
+;   Inputs from PortA.7
+ser_read:
+    LD      A, 0Eh
+    LD      (SNDREG), A
+    LD      L, 0
+
+    ; Start
+ser_read_start:
+    LD      BC, b1200_cnt
+    CALL    do_ser_wait
+    LD      A, (SNDREAD)
+    RLCA
+    JR      C, ser_read_start   ; Next on bit == 0
+
+    LD      E, 2
+    ; Centre
+ser_read_centre:
+    LD      BC, b1200_cnt
+    CALL    do_ser_wait
+    LD      A, (SNDREAD)
+    RLCA
+    JR      C, ser_read_start   ; Restart on bit == 1
+
+    DEC     E
+    JR      NZ, ser_read_centre ; Wait for centering
+
+    LD      E, 4
+    LD      D, 8
+    ; Wait and Sample
+ser_read_wait:
+    LD      BC, b1200_cnt
+    CALL    do_ser_wait
+
+    DEC     E
+    JR      NZ, ser_read_wait
+
+    LD      A, (SNDREAD)
+    ADD     A, 80h              ; Put bit 7 into carry
+    RR      L
+
+    LD      E, 4
+    DEC     D
+    JR      NZ, ser_read_wait
+
+    LD      E, 4
+    ; Stop (can omit?)
+ser_read_stop:
+    LD      BC, b1200_cnt
+    CALL    do_ser_wait
+
+    DEC     E
+    JR      NZ, ser_read_stop
+    RET
+
+; 8BC + 26BC
+; BC = 22 for 1/2400
+do_ser_wait:                    ;17
+    ; DELAY 8
+    NOP
+    NOP
+
+    DEC     BC                  ; 6
+    LD      A, C                ; 4
+    OR      B                   ; 4
+    JR      NZ, do_ser_wait     ; 12 taken, 7 not
+
+    RET                         ; 10
